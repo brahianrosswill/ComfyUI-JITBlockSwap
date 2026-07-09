@@ -34,8 +34,14 @@ block to the GPU only while its forward runs.
 ## Notes / limitations
 
 - Chain: `UNETLoader → LoraLoaderModelOnly → BlockSwap → ModelSamplingSD3 → KSampler`.
-- Requires `--disable-dynamic-vram` (legacy ModelPatcher). With dynamic VRAM
-  enabled the node logs a warning and does nothing.
+- **Requires launching ComfyUI with `--disable-dynamic-vram`** (legacy
+  ModelPatcher). Without the flag the node does NOT error or stop the
+  workflow — it passes the model through unchanged and prints
+  `[BlockSwap] dynamic VRAM patcher detected, skipping.` to the console
+  only (nothing is shown in the browser UI). The run then relies on
+  ComfyUI's standard memory management: small jobs may still succeed,
+  large models will OOM or fall back to slow partial loading. If block
+  swap "doesn't seem to work", check the console for this line first.
 - Works on any model whose diffusion model exposes `.blocks` (Wan, LTX-style
   DiTs, Flux double blocks are NOT covered — Wan-family tested).
 - Do not chain two BlockSwap nodes on the same model.
