@@ -1,4 +1,4 @@
-# ComfyUI-BlockSwap
+# ComfyUI-JITBlockSwap
 
 Block Swap (RAM Offload) node for native ComfyUI `MODEL` — run DiT models
 larger than VRAM (e.g. Wan 2.2 / Bernini-R 14B fp16, 28.6 GB on a 24 GB GPU)

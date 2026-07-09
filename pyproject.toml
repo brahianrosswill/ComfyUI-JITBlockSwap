@@ -1,5 +1,5 @@
 [project]
-name = "comfyui-blockswap"
+name = "comfyui-jitblockswap"
 description = "Block Swap (RAM Offload) node for native ComfyUI MODEL - run DiT models larger than VRAM by streaming transformer blocks from system RAM."
 version = "0.1.0"
 license = { file = "LICENSE" }
@@ -10,5 +10,5 @@ Repository = ""
 
 [tool.comfy]
 PublisherId = "kongo_jun"
-DisplayName = "ComfyUI-BlockSwap"
+DisplayName = "ComfyUI-JITBlockSwap"
 Icon = ""
