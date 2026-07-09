@@ -6,7 +6,7 @@ license = { file = "LICENSE" }
 dependencies = []
 
 [project.urls]
-Repository = ""
+Repository = "https://github.com/lovemachine100/ComfyUI-JITBlockSwap"
 
 [tool.comfy]
 PublisherId = "kongo_jun"
