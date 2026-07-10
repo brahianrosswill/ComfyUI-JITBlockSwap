@@ -196,6 +196,113 @@ def _guard_base_to(base, dm):
     base._bs_to_guarded = True
 
 
+def _is_mmap_backed(t):
+    inner = getattr(t, "_qdata", t)
+    try:
+        st = inner.untyped_storage()
+    except Exception:
+        return False
+    return getattr(st, "_comfy_tensor_mmap_refs", None) is not None
+
+
+def _materialize_block_tensors(block):
+    """Copy file-mapped (safetensors mmap) tensors into ordinary RAM.
+
+    Swap masters must not live in section-backed pages: cudaHostRegister on
+    file-mapped memory poisons the CUDA context on Windows (pin=true dies at
+    the first forward), and even unpinned pageable DMA from mmap pages under
+    WDDM pressure eventually corrupts the context ('CUDA error: invalid
+    argument' at a later unrelated transfer). comfy's own transfer paths
+    special-case mmap storages (mark_mmap_dirty etc.); a raw .to() does not."""
+    for m in block.modules():
+        for name, p in list(m.named_parameters(recurse=False)):
+            if _is_mmap_backed(p):
+                fresh = p.detach().clone()
+                m._parameters[name] = torch.nn.Parameter(fresh, requires_grad=False)
+        for name, b in list(m.named_buffers(recurse=False)):
+            if b is not None and _is_mmap_backed(b):
+                m._buffers[name] = b.detach().clone()
+
+
+def _swap_out_block(patcher, prefix, i, block, load_device, offload_device, pin_masters):
+    """Move one block to (optionally pinned) CPU masters with JIT swap forward.
+    Returns (block_bytes, pinned_bytes). Idempotent per load cycle."""
+    _deactivate_block(block)
+    block._bs_resident = False
+    size = mm.module_size(block)
+    _finalize_tree(patcher, "{}.{}".format(prefix, i), block, offload_device, unpin_all=True)
+    _materialize_block_tensors(block)
+    masters = _collect_swap_entries(block)
+    pinned = []
+    pinned_bytes = 0
+    if pin_masters:
+        for entry in masters:
+            for t in _entry_pin_targets(entry):
+                if mm.pin_memory(t):
+                    pinned.append(t)
+                    pinned_bytes += t.nbytes
+    if not hasattr(block, "_bs_orig_forward"):
+        block._bs_orig_forward = block.forward
+        block.forward = _make_swap_forward(block)
+    block._bs_state = {
+        "active": True,
+        "load_device": load_device,
+        "masters": masters,
+        "pinned": pinned,
+    }
+    return size, pinned_bytes
+
+
+def _install_partial_unload_override(patcher):
+    """Replace ModelPatcher.partially_unload for this patcher instance.
+
+    comfy's partially_unload restores weight backups and moves finalized
+    modules with Module.to(); on a blockswapped model that path corrupts the
+    CUDA context (observed: a later unrelated H2D copy dies with
+    'CUDA error: invalid argument', todo-013 repro). The semantically correct
+    way to give VRAM back on this model is to grow the swap set, so free
+    memory by converting resident blocks to swap blocks instead."""
+    if getattr(patcher, "_bs_pu_wrapped", False):
+        return
+
+    def bs_partially_unload(device_to, memory_to_free=0, force_patch_weights=False):
+        base = patcher.model
+        cfg = getattr(base, "_bs_config", None)
+        dm = getattr(base, "diffusion_model", None)
+        _, blocks = _find_blocks(dm)
+        if cfg is None or blocks is None:
+            return 0
+        freed = 0
+        pinned_bytes = 0
+        n_moved = 0
+        for i, block in enumerate(blocks):
+            if freed >= memory_to_free:
+                break
+            if getattr(block, "_bs_state", None) is not None:
+                continue  # already swapped
+            if not getattr(block, "_bs_resident", False):
+                continue  # not managed by us
+            size, pb = _swap_out_block(patcher, cfg["prefix"], i, block,
+                                       cfg["load_device"], cfg["offload_device"],
+                                       cfg["pin_masters"])
+            freed += size
+            pinned_bytes += pb
+            n_moved += 1
+        if n_moved:
+            base.model_loaded_weight_memory = max(0, base.model_loaded_weight_memory - freed)
+            base.model_lowvram = True
+            mm.soft_empty_cache()
+            logging.info("[BlockSwap] partial unload: {} more block(s) swapped to RAM, "
+                         "{:.0f} MB freed ({:.0f} MB requested).".format(
+                             n_moved, freed / (1024 * 1024), memory_to_free / (1024 * 1024)))
+        # never fall through to comfy's unpatch-based partial unload here -
+        # that is the path that poisons the CUDA context on this model
+        return freed
+
+    patcher.partially_unload = bs_partially_unload
+    patcher._bs_pu_wrapped = True
+
+
 def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full_load,
              blocks_to_swap=0, pin_masters=True):
     if patcher.is_dynamic():
@@ -248,32 +355,30 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
     pinned_bytes = 0
     for i in range(n_swap):
         block = blocks[i]
-        _deactivate_block(block)
-        _finalize_tree(patcher, "{}.{}".format(prefix, i), block, offload_device)
-        masters = _collect_swap_entries(block)
-        pinned = []
-        if pin_masters:
-            for entry in masters:
-                for t in _entry_pin_targets(entry):
-                    if mm.pin_memory(t):
-                        pinned.append(t)
-                        pinned_bytes += t.nbytes
-        if not hasattr(block, "_bs_orig_forward"):
-            block._bs_orig_forward = block.forward
-            block.forward = _make_swap_forward(block)
-        block._bs_state = {
-            "active": True,
-            "load_device": load_device,
-            "masters": masters,
-            "pinned": pinned,
-        }
-        swapped_bytes += block_sizes[i]
+        # unpin_all: release comfy's own load-time registrations on this block
+        # first - they'd never be used again (the block bypasses the cast path)
+        # and they eat into MAX_PINNED_MEMORY (RAM*0.40 on Windows); running
+        # into that cap makes a later cudaHostRegister fail and leave a sticky
+        # async CUDA error that kills an unrelated call ('invalid argument')
+        swapped, pinned = _swap_out_block(patcher, prefix, i, block, load_device,
+                                          offload_device, pin_masters)
+        swapped_bytes += swapped
+        pinned_bytes += pinned
 
     # 2) make everything else fully GPU-resident (no per-layer cast path)
     for i in range(n_swap, total):
         block = blocks[i]
         _deactivate_block(block)
         _finalize_tree(patcher, "{}.{}".format(prefix, i), block, load_device, unpin_all=True)
+        block._bs_resident = True
+
+    base._bs_config = {
+        "prefix": prefix,
+        "load_device": load_device,
+        "offload_device": offload_device,
+        "pin_masters": pin_masters,
+    }
+    _install_partial_unload_override(patcher)
 
     for sub_name, m in dm.named_modules():
         if sub_name == block_attr or sub_name.startswith(block_attr + "."):
@@ -305,6 +410,7 @@ def _on_detach(patcher, unpatch_all):
         return
     for block in blocks:
         _deactivate_block(block)
+        block._bs_resident = False
 
 
 class BlockSwap:

@@ -70,6 +70,20 @@ subclasses, which need special handling implemented here:
   (`CUDA error: invalid argument` much later). The node guards the base
   model's `.to()` to unpin first.
 
+## Known issue (open)
+
+Large bf16 checkpoints (LTX-2.3 22B bf16, 43 GB, 30/48 blocks swapped) fail
+after the first sampling pass with `CUDA error: invalid argument` when the
+next node moves its own model to the GPU (observed with LTXVLatentUpsampler
+in a 2-pass workflow). Sampling itself completes at full speed; the CUDA
+context is left poisoned. Ruled out so far: runtime LoRA, pin_memory (fails
+with pinning disabled), comfy's own pin budget, ModelPatcher.partially_unload
+(fails without it running), mmap-backed masters (fails after materializing
+them to plain RAM), comfy-aimdo allocator (not active in legacy mode).
+The fp8 checkpoint (29 GB, 14 blocks) and Wan 14B fp16 flows are unaffected.
+Until fixed, do not combine BlockSwap with 40 GB-class bf16 checkpoints in
+multi-model workflows.
+
 **Caveat — fp8 + runtime LoRA:** with `--disable-dynamic-vram`, ComfyUI's
 legacy loader merges LoRA into fp8 weights per-key on a VRAM-packed GPU and
 can crawl for hours *before* this node's `ON_LOAD` hook ever runs. BlockSwap
