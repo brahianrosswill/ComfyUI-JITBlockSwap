@@ -77,19 +77,24 @@ subclasses, which need special handling implemented here:
   (`CUDA error: invalid argument` much later). The node guards the base
   model's `.to()` to unpin first.
 
-## Known issue (open, BlockSwapLTX)
+## Known limitation (BlockSwapLTX + 40 GB-class checkpoints)
 
-Large bf16 checkpoints (LTX-2.3 22B bf16, 43 GB, 30/48 blocks swapped) fail
-after the first sampling pass with `CUDA error: invalid argument` when the
-next node moves its own model to the GPU (observed with LTXVLatentUpsampler
-in a 2-pass workflow). Sampling itself completes at full speed; the CUDA
-context is left poisoned. Ruled out so far: runtime LoRA, pin_memory (fails
-with pinning disabled), comfy's own pin budget, ModelPatcher.partially_unload
-(fails without it running), mmap-backed masters (fails after materializing
-them to plain RAM), comfy-aimdo allocator (not active in legacy mode).
-The fp8 checkpoint (29 GB, 14 blocks) and Wan 14B fp16 flows are unaffected.
-Until fixed, do not combine BlockSwap with 40 GB-class bf16 checkpoints in
-multi-model workflows.
+Very large checkpoints (LTX-2.3 22B bf16, 43 GB, 30/48 blocks swapped) can
+fail with `CUDA error: invalid argument` on the next device transfer even
+though every ON_LOAD phase synchronizes cleanly. Root cause: **Windows
+commit-charge exhaustion**, not a CUDA bug — the swap masters plus LoRA
+backups add ~40 GB of committed CPU memory on top of the model, the text
+encoder and WDDM's backing reservations, and once the commit limit
+(RAM + pagefile) is hit the driver refuses the staging allocation behind the
+copy (measured: 161.9 / 166.3 GB committed at failure with 30 GB of physical
+RAM still free; a synchronize needs no new commit and passes, the next copy
+does not). Smaller flows (fp8 29 GB / Wan 14B fp16) fit and are unaffected.
+
+Workaround: set a large fixed pagefile (e.g. 64 GB — commit is reserved, not
+written, so this costs no I/O), or run such checkpoints without BlockSwap.
+After a failed run, restart ComfyUI before queueing anything else: the dead
+model's commit lingers and can take the next, otherwise-fine job down with
+it.
 
 **Caveat — fp8 + runtime LoRA:** with `--disable-dynamic-vram`, ComfyUI's
 legacy loader merges LoRA into fp8 weights per-key on a VRAM-packed GPU and
