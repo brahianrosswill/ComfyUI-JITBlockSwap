@@ -18,6 +18,20 @@ placement itself).
 
 import functools
 import logging
+import os
+
+_BS_DEBUG_SYNC = os.environ.get("BS_DEBUG_SYNC") == "1"
+
+
+def _dbg_sync(tag):
+    if not _BS_DEBUG_SYNC:
+        return
+    try:
+        torch.cuda.synchronize()
+        logging.info("[BlockSwapDBG] sync OK: %s", tag)
+    except Exception as e:
+        logging.error("[BlockSwapDBG] sync FAILED at %s: %s", tag, e)
+        raise
 
 import torch
 
@@ -268,12 +282,14 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
             "pinned": pinned,
         }
         swapped_bytes += block_sizes[i]
+        _dbg_sync("swap block {}".format(i))
 
     # 2) make everything else fully GPU-resident (no per-layer cast path)
     for i in range(n_swap, total):
         block = blocks[i]
         _deactivate_block(block)
         _finalize_tree(patcher, "{}.{}".format(prefix, i), block, load_device, unpin_all=True)
+        _dbg_sync("resident block {}".format(i))
 
     for sub_name, m in dm.named_modules():
         if sub_name == block_attr or sub_name.startswith(block_attr + "."):
@@ -282,6 +298,7 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
         _finalize_module(patcher, full, m, load_device, unpin_all=True)
         if sub_name and "." not in sub_name:
             m.to(load_device)
+            _dbg_sync("non-block module {}".format(sub_name))
     # root-level tensors of the diffusion model itself
     for t in list(dm.parameters(recurse=False)) + list(dm.buffers(recurse=False)):
         t.data = t.data.to(load_device)
@@ -291,7 +308,9 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
     base.model_loaded_weight_memory = resident
     base.model_offload_buffer_memory = (max(block_sizes) if n_swap > 0 else 0) + _SWAP_BUFFER_EXTRA
 
+    _dbg_sync("root tensors")
     mm.soft_empty_cache()
+    _dbg_sync("after soft_empty_cache")
     logging.info("[BlockSwap] {} / {} blocks swapped to RAM: {:.0f} MB offloaded"
                  " ({:.0f} MB pinned), {:.0f} MB resident on GPU.".format(
                      n_swap, total, swapped_bytes / (1024 * 1024),
