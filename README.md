@@ -42,8 +42,38 @@ block to the GPU only while its forward runs.
   ComfyUI's standard memory management: small jobs may still succeed,
   large models will OOM or fall back to slow partial loading. If block
   swap "doesn't seem to work", check the console for this line first.
-- Works on any model whose diffusion model exposes `.blocks` (Wan, LTX-style
-  DiTs, Flux double blocks are NOT covered — Wan-family tested).
+- Works on any model whose diffusion model exposes `.blocks` or
+  `.transformer_blocks` (Wan-family and LTX-2.3 22B AV tested; Flux double
+  blocks are NOT covered).
 - Do not chain two BlockSwap nodes on the same model.
 - Approx. cost: one PCIe H2D transfer per swapped block per forward call
   (~25-30 ms per 660 MB fp16 block on PCIe 4.0 x16).
+
+## LTX-2.3 22B (fp8) support
+
+Tested 2026-07-10 on RTX 4090 24 GB with `ltx-2.3-22b-dev-fp8.safetensors`
+(48 `transformer_blocks`): 360×360×49f I2V completed in **40.2 s** with
+`blocks_to_swap=12` (auto-raised to 14 to fit the weight budget), 17.9 GB
+resident vs a fully packed card without the node (47.4 s) — sample workflows
+in `workflows/`.
+
+fp8 checkpoints store weights as `comfy_kitchen` QuantizedTensor wrapper
+subclasses, which need special handling implemented here:
+
+- Wrapper subclasses cannot be moved with the `.data` repointing trick (their
+  device is fixed at construction and the quantized payload lives in
+  `_qdata`); swapped QuantizedTensor params are exchanged at the module
+  attribute level instead.
+- A sibling ModelPatcher clone (a chain without BlockSwap) calling
+  `unpatch_model → model.to()` makes `Module._apply` rebuild the wrappers,
+  which would free a still-pinned `_qdata` and poison the CUDA context
+  (`CUDA error: invalid argument` much later). The node guards the base
+  model's `.to()` to unpin first.
+
+**Caveat — fp8 + runtime LoRA:** with `--disable-dynamic-vram`, ComfyUI's
+legacy loader merges LoRA into fp8 weights per-key on a VRAM-packed GPU and
+can crawl for hours *before* this node's `ON_LOAD` hook ever runs. BlockSwap
+cannot help there. Either run fp8+LoRA workflows with dynamic VRAM (default,
+where this node is a no-op), or pre-merge the LoRA (bf16 merge → requantize
+to fp8) and drop the LoRA loader from the chain. fp16/bf16 + LoRA are
+unaffected.
