@@ -5,9 +5,17 @@ larger than VRAM (e.g. Wan 2.2 / Bernini-R 14B fp16, 28.6 GB on a 24 GB GPU)
 by keeping the first N transformer blocks in system RAM and streaming each
 block to the GPU only while its forward runs.
 
-## Node
+## Nodes
 
-`advanced/model` → **Block Swap (RAM Offload)** (`BlockSwap`)
+Two separate nodes so the battle-tested Wan path never shares code with the
+newer LTX/fp8 path:
+
+| node | class | targets | code |
+|---|---|---|---|
+| **Block Swap (RAM Offload)** | `BlockSwap` | Wan 2.2 / Bernini-R (`.blocks`, plain fp16/bf16) | `blockswap.py` — frozen at the Wan-verified implementation |
+| **Block Swap LTX (RAM Offload)** | `BlockSwapLTX` | LTX-2.3 22B AV (`.transformer_blocks`, incl. comfy_kitchen fp8 QuantizedTensor) | `blockswap_ltx.py` — adds wrapper-subclass (fp8 QuantizedTensor) swap and a base.to() unpin guard |
+
+Shared inputs:
 
 | input | default | meaning |
 |---|---|---|
@@ -42,9 +50,9 @@ block to the GPU only while its forward runs.
   ComfyUI's standard memory management: small jobs may still succeed,
   large models will OOM or fall back to slow partial loading. If block
   swap "doesn't seem to work", check the console for this line first.
-- Works on any model whose diffusion model exposes `.blocks` or
-  `.transformer_blocks` (Wan-family and LTX-2.3 22B AV tested; Flux double
-  blocks are NOT covered).
+- `BlockSwap` targets `.blocks` (Wan-family, tested); `BlockSwapLTX` also
+  detects `.transformer_blocks` (LTX-2.3 22B AV). Flux double blocks are NOT
+  covered.
 - Do not chain two BlockSwap nodes on the same model.
 - Approx. cost: one PCIe H2D transfer per swapped block per forward call
   (~25-30 ms per 660 MB fp16 block on PCIe 4.0 x16).
@@ -70,7 +78,7 @@ subclasses, which need special handling implemented here:
   (`CUDA error: invalid argument` much later). The node guards the base
   model's `.to()` to unpin first.
 
-## Known issue (open)
+## Known issue (open, BlockSwapLTX)
 
 Large bf16 checkpoints (LTX-2.3 22B bf16, 43 GB, 30/48 blocks swapped) fail
 after the first sampling pass with `CUDA error: invalid argument` when the

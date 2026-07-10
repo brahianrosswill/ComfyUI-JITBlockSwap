@@ -1,10 +1,15 @@
 """Block Swap (RAM Offload) for native ComfyUI MODEL.
 
-Keeps the first N transformer blocks of a DiT (Wan 2.2 / Bernini-R etc.)
-resident in system RAM (optionally pinned) and streams each block to the
-GPU only for the duration of its forward call. Weight patches (LoRA) are
-baked into the CPU-resident weights once at load time, so the slow
-per-layer LowVramPatch cast path is avoided entirely.
+Keeps the first N transformer blocks of a DiT (Wan 2.2 / Bernini-R,
+LTX-2.3 22B AV, etc.) resident in system RAM (optionally pinned) and
+streams each block to the GPU only for the duration of its forward call.
+Weight patches (LoRA) are baked into the CPU-resident weights once at load
+time, so the slow per-layer LowVramPatch cast path is avoided entirely.
+
+The repeated-block ModuleList is looked up under either of two attribute
+names (see _BLOCK_ATTR_CANDIDATES below) since different model families
+name it differently: Wan 2.2 / Bernini-R use "blocks", LTX-2.3 uses
+"transformer_blocks".
 
 Designed against ComfyUI v0.26.x legacy ModelPatcher (--disable-dynamic-vram).
 With dynamic VRAM enabled the node is a no-op (dynamic mode manages
@@ -20,10 +25,29 @@ import comfy.model_management as mm
 import comfy.model_patcher
 from comfy.patcher_extension import CallbacksMP
 
-CALLBACK_KEY = "blockswap_ram_offload"
+try:
+    from comfy.quant_ops import QuantizedTensor
+except Exception:  # older ComfyUI without quant_ops
+    QuantizedTensor = ()
+
+CALLBACK_KEY = "blockswap_ltx_ram_offload"
 
 # transient VRAM headroom for the block(s) in flight during swapping
 _SWAP_BUFFER_EXTRA = 128 * 1024 * 1024
+
+# Name of the ModuleList holding the repeated transformer blocks. Differs by
+# model family: Wan 2.2 / Bernini-R use "blocks", LTX-2.3 (diffusers-style
+# naming, see comfy/ldm/lightricks/model.py _init_transformer_blocks) uses
+# "transformer_blocks". Tried in order, first match wins.
+_BLOCK_ATTR_CANDIDATES = ("blocks", "transformer_blocks")
+
+
+def _find_blocks(dm):
+    for name in _BLOCK_ATTR_CANDIDATES:
+        blocks = getattr(dm, name, None)
+        if blocks is not None:
+            return name, blocks
+    return None, None
 
 
 def _make_swap_forward(block):
@@ -36,8 +60,20 @@ def _make_swap_forward(block):
         load_device = state["load_device"]
         masters = state["masters"]
         non_blocking = not state.get("sync_transfers", True)
-        for t, master in masters:
-            t.data = master.to(load_device, non_blocking=non_blocking)
+        for entry in masters:
+            if entry[0] == "data":
+                _, t, master = entry
+                t.data = master.to(load_device, non_blocking=non_blocking)
+            else:
+                # wrapper subclasses (comfy_kitchen QuantizedTensor): device is
+                # baked into the wrapper at construction, so .data swap cannot
+                # move them - swap the module attribute with a GPU copy instead
+                _, module, name, master, is_param = entry
+                moved = master.to(load_device, non_blocking=non_blocking)
+                if is_param:
+                    module._parameters[name] = torch.nn.Parameter(moved, requires_grad=False)
+                else:
+                    module._buffers[name] = moved
         if not non_blocking:
             # serialize the queue before compute: async submission of large
             # pinned H2D copies interleaved with DiT kernels busy-loop hangs
@@ -46,17 +82,50 @@ def _make_swap_forward(block):
         try:
             return orig_forward(*args, **kwargs)
         finally:
-            for t, master in masters:
-                t.data = master
+            for entry in masters:
+                if entry[0] == "data":
+                    _, t, master = entry
+                    t.data = master
+                else:
+                    _, module, name, master, is_param = entry
+                    if is_param:
+                        module._parameters[name] = master
+                    else:
+                        module._buffers[name] = master
 
     return swap_forward
 
 
-def _iter_block_tensors(block):
-    for p in block.parameters(recurse=True):
-        yield p
-    for b in block.buffers(recurse=True):
-        yield b
+def _collect_swap_entries(block):
+    """Enumerate the block's tensors as swap entries.
+
+    Plain tensors use the in-place .data swap (no attribute churn, D2H-free
+    restore). Wrapper subclasses (QuantizedTensor) must be swapped at the
+    module-attribute level, and their pinnable CPU storage is the inner
+    _qdata rather than the wrapper."""
+    entries = []
+    for mod_name, m in block.named_modules():
+        for name, p in list(m.named_parameters(recurse=False)):
+            if isinstance(p, QuantizedTensor) or isinstance(getattr(p, "data", None), QuantizedTensor):
+                master = m._parameters[name]
+                entries.append(("attr", m, name, master, True))
+            else:
+                entries.append(("data", p, p.data))
+        for name, b in list(m.named_buffers(recurse=False)):
+            if isinstance(b, QuantizedTensor):
+                entries.append(("attr", m, name, b, False))
+            else:
+                entries.append(("data", b, b.data))
+    return entries
+
+
+def _entry_pin_targets(entry):
+    """CPU tensors of this entry that can be page-locked."""
+    if entry[0] == "data":
+        return [entry[2]]
+    master = entry[3]
+    inner = getattr(master, "_qdata", None)
+    return [inner] if inner is not None else []
 
 
 def _finalize_module(patcher, name, module, target_device, unpin_all=False):
@@ -102,6 +171,31 @@ def _deactivate_block(block, unpin=True):
     block._bs_state = None
 
 
+def _guard_base_to(base, dm):
+    """Ensure our pins never outlive a weight move we don't control.
+
+    A sibling ModelPatcher clone (e.g. a LoRA chain without BlockSwap) calls
+    unpatch_model -> base.to(offload) on the SHARED torch model. Module._apply
+    rebuilds wrapper-subclass params (QuantizedTensor) even for a same-device
+    move, freeing the inner _qdata while it is still cudaHostRegister'ed - the
+    dangling registration then kills an unrelated CUDA call with
+    'invalid argument'. Deactivate (and unpin) all swap state before any
+    whole-model .to()."""
+    if getattr(base, "_bs_to_guarded", False):
+        return
+    orig_to = base.to
+
+    def guarded_to(*args, **kwargs):
+        _, blocks = _find_blocks(dm)
+        if blocks is not None:
+            for block in blocks:
+                _deactivate_block(block)
+        return orig_to(*args, **kwargs)
+
+    base.to = guarded_to
+    base._bs_to_guarded = True
+
+
 def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full_load,
              blocks_to_swap=0, pin_masters=True):
     if patcher.is_dynamic():
@@ -110,9 +204,10 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
         return
     base = patcher.model
     dm = getattr(base, "diffusion_model", None)
-    blocks = getattr(dm, "blocks", None)
+    block_attr, blocks = _find_blocks(dm)
     if blocks is None:
-        logging.warning("[BlockSwap] model has no diffusion_model.blocks, skipping.")
+        logging.warning("[BlockSwap] model has no diffusion_model.blocks / "
+                        ".transformer_blocks, skipping.")
         return
 
     offload_device = patcher.offload_device
@@ -120,6 +215,8 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
     if not mm.is_device_cuda(load_device):
         logging.warning("[BlockSwap] load device is not CUDA, skipping.")
         return
+
+    _guard_base_to(base, dm)
 
     total = len(blocks)
     n_swap = max(0, min(int(blocks_to_swap), total))
@@ -144,7 +241,7 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
                          "{:.0f} MB VRAM weight budget.".format(
                              blocks_to_swap, n_swap, lowvram_model_memory / (1024 * 1024)))
 
-    prefix = "diffusion_model.blocks"
+    prefix = "diffusion_model.{}".format(block_attr)
 
     # 1) offload swap blocks first to free VRAM
     swapped_bytes = 0
@@ -153,13 +250,14 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
         block = blocks[i]
         _deactivate_block(block)
         _finalize_tree(patcher, "{}.{}".format(prefix, i), block, offload_device)
-        masters = []
+        masters = _collect_swap_entries(block)
         pinned = []
-        for t in _iter_block_tensors(block):
-            masters.append((t, t.data))
-            if pin_masters and mm.pin_memory(t.data):
-                pinned.append(t.data)
-                pinned_bytes += t.data.nbytes
+        if pin_masters:
+            for entry in masters:
+                for t in _entry_pin_targets(entry):
+                    if mm.pin_memory(t):
+                        pinned.append(t)
+                        pinned_bytes += t.nbytes
         if not hasattr(block, "_bs_orig_forward"):
             block._bs_orig_forward = block.forward
             block.forward = _make_swap_forward(block)
@@ -178,7 +276,7 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
         _finalize_tree(patcher, "{}.{}".format(prefix, i), block, load_device, unpin_all=True)
 
     for sub_name, m in dm.named_modules():
-        if sub_name == "blocks" or sub_name.startswith("blocks."):
+        if sub_name == block_attr or sub_name.startswith(block_attr + "."):
             continue
         full = "diffusion_model.{}".format(sub_name) if sub_name else "diffusion_model"
         _finalize_module(patcher, full, m, load_device, unpin_all=True)
@@ -202,14 +300,14 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
 
 def _on_detach(patcher, unpatch_all):
     dm = getattr(patcher.model, "diffusion_model", None)
-    blocks = getattr(dm, "blocks", None)
+    _, blocks = _find_blocks(dm)
     if blocks is None:
         return
     for block in blocks:
         _deactivate_block(block)
 
 
-class BlockSwap:
+class BlockSwapLTX:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -247,9 +345,9 @@ class BlockSwap:
 
 
 NODE_CLASS_MAPPINGS = {
-    "BlockSwap": BlockSwap,
+    "BlockSwapLTX": BlockSwapLTX,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "BlockSwap": "Block Swap (RAM Offload)",
+    "BlockSwapLTX": "Block Swap LTX (RAM Offload)",
 }
