@@ -62,8 +62,7 @@ Shared inputs:
 Tested 2026-07-10 on RTX 4090 24 GB with `ltx-2.3-22b-dev-fp8.safetensors`
 (48 `transformer_blocks`): 360×360×49f I2V completed in **40.2 s** with
 `blocks_to_swap=12` (auto-raised to 14 to fit the weight budget), 17.9 GB
-resident vs a fully packed card without the node (47.4 s) — sample workflows
-in `workflows/`.
+resident vs a fully packed card without the node (47.4 s).
 
 fp8 checkpoints store weights as `comfy_kitchen` QuantizedTensor wrapper
 subclasses, which need special handling implemented here:
