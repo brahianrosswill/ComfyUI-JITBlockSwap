@@ -1,10 +1,15 @@
 """Block Swap (RAM Offload) for native ComfyUI MODEL.
 
-Keeps the first N transformer blocks of a DiT (Wan 2.2 / Bernini-R etc.)
-resident in system RAM (optionally pinned) and streams each block to the
-GPU only for the duration of its forward call. Weight patches (LoRA) are
-baked into the CPU-resident weights once at load time, so the slow
-per-layer LowVramPatch cast path is avoided entirely.
+Keeps the first N transformer blocks of a DiT (Wan 2.2 / Bernini-R,
+LTX-2.3 22B AV, etc.) resident in system RAM (optionally pinned) and
+streams each block to the GPU only for the duration of its forward call.
+Weight patches (LoRA) are baked into the CPU-resident weights once at load
+time, so the slow per-layer LowVramPatch cast path is avoided entirely.
+
+The repeated-block ModuleList is looked up under either of two attribute
+names (see _BLOCK_ATTR_CANDIDATES below) since different model families
+name it differently: Wan 2.2 / Bernini-R use "blocks", LTX-2.3 uses
+"transformer_blocks".
 
 Designed against ComfyUI v0.26.x legacy ModelPatcher (--disable-dynamic-vram).
 With dynamic VRAM enabled the node is a no-op (dynamic mode manages
@@ -24,6 +29,20 @@ CALLBACK_KEY = "blockswap_ram_offload"
 
 # transient VRAM headroom for the block(s) in flight during swapping
 _SWAP_BUFFER_EXTRA = 128 * 1024 * 1024
+
+# Name of the ModuleList holding the repeated transformer blocks. Differs by
+# model family: Wan 2.2 / Bernini-R use "blocks", LTX-2.3 (diffusers-style
+# naming, see comfy/ldm/lightricks/model.py _init_transformer_blocks) uses
+# "transformer_blocks". Tried in order, first match wins.
+_BLOCK_ATTR_CANDIDATES = ("blocks", "transformer_blocks")
+
+
+def _find_blocks(dm):
+    for name in _BLOCK_ATTR_CANDIDATES:
+        blocks = getattr(dm, name, None)
+        if blocks is not None:
+            return name, blocks
+    return None, None
 
 
 def _make_swap_forward(block):
@@ -110,9 +129,10 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
         return
     base = patcher.model
     dm = getattr(base, "diffusion_model", None)
-    blocks = getattr(dm, "blocks", None)
+    block_attr, blocks = _find_blocks(dm)
     if blocks is None:
-        logging.warning("[BlockSwap] model has no diffusion_model.blocks, skipping.")
+        logging.warning("[BlockSwap] model has no diffusion_model.blocks / "
+                        ".transformer_blocks, skipping.")
         return
 
     offload_device = patcher.offload_device
@@ -144,7 +164,7 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
                          "{:.0f} MB VRAM weight budget.".format(
                              blocks_to_swap, n_swap, lowvram_model_memory / (1024 * 1024)))
 
-    prefix = "diffusion_model.blocks"
+    prefix = "diffusion_model.{}".format(block_attr)
 
     # 1) offload swap blocks first to free VRAM
     swapped_bytes = 0
@@ -178,7 +198,7 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
         _finalize_tree(patcher, "{}.{}".format(prefix, i), block, load_device, unpin_all=True)
 
     for sub_name, m in dm.named_modules():
-        if sub_name == "blocks" or sub_name.startswith("blocks."):
+        if sub_name == block_attr or sub_name.startswith(block_attr + "."):
             continue
         full = "diffusion_model.{}".format(sub_name) if sub_name else "diffusion_model"
         _finalize_module(patcher, full, m, load_device, unpin_all=True)
@@ -202,7 +222,7 @@ def _on_load(patcher, device_to, lowvram_model_memory, force_patch_weights, full
 
 def _on_detach(patcher, unpatch_all):
     dm = getattr(patcher.model, "diffusion_model", None)
-    blocks = getattr(dm, "blocks", None)
+    _, blocks = _find_blocks(dm)
     if blocks is None:
         return
     for block in blocks:
