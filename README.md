@@ -131,28 +131,39 @@ multi-reference (`_forward_with_refs`), Ostris `kv_cache` — complete and are
 6.4 GB resident instead of 12.9 GB. Stable across repeated runs and
 `/free` unload cycles.
 
-### Known broken: runtime LoRA, and bf16-scale checkpoints
+### bf16 / runtime-LoRA workflows: launch with `--disable-pinned-memory`
 
-- **Any runtime LoRA in the chain** (which makes comfy's loader report
-  `lowvram patches: N` and pin weights during its own load pass) leads to
-  `CUDA error: invalid argument` during load or at first VAE decode, with
-  weight corruption (psychedelic output) when the run survives. Reproduced
-  with pin_memory on AND off, with `--novram`, and with commit charge far
-  below the limit — so this is NOT the commit-charge limitation below, and
-  not the fp8-LoRA-merge stall either (bf16 shows it too). The shared
-  `_finalize_module` bake path interacting with comfy's partial-load
-  lowvram-patch state is the prime suspect; the Wan/LTX nodes should be
-  re-validated with runtime LoRA on this ComfyUI version as well.
-- **`krea2_turbo_bf16` (24.5 GB) without LoRA**: sampling itself works
-  (14/28 swapped, 8.5 s/it at 1024², vs comfy's own lowvram path which
-  crawls at ~4.5 min/it and busy-loop hangs), but the CUDA context is left
-  poisoned — the NEXT model load/unload dies with `invalid argument`.
-  Restart ComfyUI after each bf16 run if you use this today.
+Root-caused 2026-07-13. On Windows with ComfyUI's mmap weight loader
+(comfy-aimdo `ModelMMAP`: checkpoint tensors are `frombuffer` views over
+file-backed pages), host memory registration (`cudaHostRegister`) in
+legacy `--disable-dynamic-vram` mode can queue **asynchronous** CUDA
+errors — ComfyUI's own `pin_memory()` even carries a comment documenting
+this ("proven cases where this also queues an error on the GPU async").
+At bf16 scale (24.5 GB checkpoint, 11.6 GB of swap masters, plus comfy's
+own pins of lowvram-offloaded weights) this reliably poisons the CUDA
+context: symptoms are silent H2D transfer corruption (psychedelic weight
+garbage in outputs) and deferred `CUDA error: invalid argument` at the
+next load, VAE decode or `/free`. Small pin footprints (fp8, 5.8 GB)
+survive by luck.
 
-Until the LoRA bake path is fixed for current ComfyUI, the practical Krea2
-recipes are: fp8 without LoRA + BlockSwapKrea2 (verified above), or any
-LoRA workflow under dynamic VRAM (default launch) where this node is a
-no-op and comfy manages placement itself.
+**Workaround (verified)**: add `--disable-pinned-memory` alongside
+`--disable-dynamic-vram`. With ALL host registration off,
+`krea2_turbo_bf16` (24.5 GB) + style-reference LoRA + multi-reference
+Ostris edit runs correctly on a 24 GB GPU — clean styled output, stable
+across `/free`/reload cycles, 12.3 s/it at 1024² (vs 8.5 s/it pinned
+before it poisons itself, and ~4.5 min/it + busy-loop hang for comfy's
+own lowvram path without this node). The LoRA bake path itself was never
+at fault. Unpinned swap costs about +5% wall clock on PCIe 4.0 x16
+because this node's transfers are serialized anyway (see WDDM note
+above).
+
+This likely also explains (or compounds) the commit-charge limitation
+below — same failure signature. The Wan/LTX verified configs predate the
+mmap loader or used small pin footprints; with pinning enabled on
+current ComfyUI treat them as at-risk and prefer
+`--disable-pinned-memory` there too. A proper in-node fix (copy swap
+masters into freshly allocated pinned buffers instead of registering
+mmap-backed pages in place) is future work.
 
 **Caveat — fp8 + runtime LoRA:** with `--disable-dynamic-vram`, ComfyUI's
 legacy loader merges LoRA into fp8 weights per-key on a VRAM-packed GPU and
